@@ -7,9 +7,9 @@ from fastapi import Request
 
 from inference import model_fn,predict_fn,prepare_opt
 
+model = model_fn()
 
 app = FastAPI()
-
 
 @app.get('/ping')
 async def ping():
@@ -25,7 +25,7 @@ async def invocations(request: Request):
 
 def inference_fn(data):
     data=prepare_opt(data)
-    model=None
+    # model=None
     return {'result':predict_fn(data,model)}
 
 

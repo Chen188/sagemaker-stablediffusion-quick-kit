@@ -47,6 +47,7 @@ from diffusers.utils import load_image
 
 import cv2
 import numpy as np
+import s3fs
 
 #load utils and controle_net
 from utils import quick_download_s3,get_bucket_and_key,untar
@@ -62,20 +63,18 @@ max_width = os.environ.get("max_width", 768)
 max_steps = os.environ.get("max_steps", 100)
 max_count = os.environ.get("max_count", 4)
 s3_bucket = os.environ.get("s3_bucket", "")
-watermarket=os.environ.get("watermarket", True)
+watermarket=json.loads(os.environ.get("watermarket", 'true'))
 watermarket_image=os.environ.get("watermarket_image", "sagemaker-logo-small.png")
 custom_region = os.environ.get("custom_region", None)
 safety_checker_enable = json.loads(os.environ.get("safety_checker_enable", "false"))
-control_net_enable=os.environ.get("control_net_enable", "enable")
-deepspeed_enable=os.environ.get("deepspeed", False)
+control_net_enable=json.loads(os.environ.get("control_net_enable", "true"))
+deepspeed_enable=json.loads(os.environ.get("deepspeed", 'false'))
 
 DEFAULT_MODEL="runwayml/stable-diffusion-v1-5"
 
-
-processor=ControlNetDectecProcessor()
-init_control_net_model()
-
-
+if control_net_enable:
+    processor=ControlNetDectecProcessor()
+    init_control_net_model()
 
 #control_net
 control_net_prefix="lllyasviel/sd-controlnet"
@@ -87,8 +86,6 @@ control_net_postfix=[
     "openpose",
     "scribble"
 ]
-
-
 
 controle_net_cache={}
 
@@ -153,8 +150,6 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-
-
 def init_pipeline(model_name: str,model_args=None):
     """
     help load model from s3
@@ -169,28 +164,39 @@ def init_pipeline(model_name: str,model_args=None):
         )
         print(f"load {model_name} with controle net")
         return pipe
+    else:
+        print(f"load {model_name} without controle net")
 
-                
     model_path=model_name
     base_name=os.path.basename(model_name)
     try:
         if model_name.startswith("s3://"):
-            if base_name=="model.tar.gz":
+            fs = s3fs.S3FileSystem()
+
+            if base_name[-7:]==".tar.gz":
+                print('model in single tar file.')
                 local_path= "/".join(model_name.split("/")[-2:-1])
-                model_path=f"/tmp/{local_path}"
+                model_path=f"/tmp/{local_path}/"
                 print(f"need copy {model_name} to {model_path}")
-                os.makedirs(model_path)
-                fs.get(model_name,model_path+"/", recursive=True)
-                untar(f"/tmp/{local_path}/model.tar.gz",model_path)
-                os.remove(f"/tmp/{local_path}/model.tar.gz")
-                print("download and untar  completed")
-            else:
+                if not os.path.exists(model_path):
+                    os.makedirs(model_path)
+
+                fs.get(model_name, model_path, recursive=True)
+                untar(f"/tmp/{local_path}/{base_name}", model_path)
+                os.remove(f"/tmp/{local_path}/{base_name}")
+                print("download and untar completed")
+            elif model_name[-1:] == '/':
+                print('model in folder.')
                 local_path= "/".join(model_name.split("/")[-2:])
                 model_path=f"/tmp/{local_path}"
                 print(f"need copy {model_name} to {model_path}")
-                os.makedirs(model_path)
-                fs.get(model_name,model_path, recursive=True)
+                if not os.path.exists(model_path):
+                    os.makedirs(model_path)
+
+                fs.get(model_name, model_path, recursive=True)
                 print("download completed")
+            else:
+                print(f'model file "{model_name}" is not support. if input is folder, pls append "/" at end of model_name.')
 
         print(f"pretrained model_path: {model_path}")
         if model_args is not None:
@@ -203,20 +209,20 @@ def init_pipeline(model_name: str,model_args=None):
         return None
 
     
-model_name = os.environ.get("model_name", DEFAULT_MODEL)
-model_args = json.loads(os.environ['model_args']) if (
-        'model_args' in os.environ) else None
-#warm model load 
-init_pipeline(model_name,model_args)
+# model_name = os.environ.get("model_name", DEFAULT_MODEL)
+# model_args = json.loads(os.environ['model_args']) if (
+#         'model_args' in os.environ) else None
+# #warm model load 
+# init_pipeline(model_name,model_args)
 
 
-def model_fn(model_dir):
+def model_fn():
     """
     Load the model for inference,load model from os.environ['model_name'],diffult use runwayml/stable-diffusion-v1-5
     
     """
     print("=================model_fn=================")
-    print(f"model_dir: {model_dir}")
+    # print(f"model_dir: {model_dir}")
     model_name = os.environ.get("model_name", DEFAULT_MODEL)
     model_args = json.loads(os.environ['model_args']) if (
         'model_args' in os.environ) else None
@@ -314,8 +320,6 @@ def predict_fn(input_data, model):
     prediction = []
 
     try:
-
-
         bucket= get_default_bucket()
     
         if bucket is None:
@@ -341,7 +345,7 @@ def predict_fn(input_data, model):
             init_img = Image.open(io.BytesIO(response.content)).convert("RGB")
             init_img = init_img.resize(
                 (input_data["width"], input_data["height"]))
-            if control_net_enable is False:
+            if not control_net_enable:
                 model = StableDiffusionImg2ImgPipeline(**model.components)  # need use Img2ImgPipeline
                 
                 
@@ -380,7 +384,7 @@ def predict_fn(input_data, model):
                     if control_net_detect=="true":
                         images.append(control_net_input_image)
                     images.append(grid_image)
-                        
+
                 else:
                     images = model(input_data["prompt"], image=init_img, negative_prompt=input_data["negative_prompt"],
                                num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
