@@ -23,13 +23,13 @@ import numpy as np
 
 
 control_net_postfix=[
-                                    "canny",
-                                    "depth",
-                                    "hed",
-                                    "mlsd",
-                                    "openpose",
-                                    "scribble"
-                                ]
+    "canny",
+    "depth",
+    "hed",
+    "mlsd",
+    "openpose",
+    "scribble"
+]
 
 
 

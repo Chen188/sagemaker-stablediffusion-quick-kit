@@ -21,6 +21,8 @@ import io
 import sys
 import tarfile
 import traceback
+import base64
+import random
 
 from PIL import Image
 
@@ -33,13 +35,18 @@ from PIL import Image
 from transformers import pipeline as depth_pipeline
 
 from torch import autocast
-from diffusers import StableDiffusionPipeline,StableDiffusionImg2ImgPipeline
-from diffusers import AltDiffusionPipeline, AltDiffusionImg2ImgPipeline
-from diffusers import EulerDiscreteScheduler, EulerAncestralDiscreteScheduler, HeunDiscreteScheduler, LMSDiscreteScheduler, KDPM2DiscreteScheduler, KDPM2AncestralDiscreteScheduler,DDIMScheduler
+
+from diffusers import (
+    StableDiffusionPipeline,StableDiffusionImg2ImgPipeline,
+    StableDiffusionControlNetPipeline, 
+    AltDiffusionPipeline, AltDiffusionImg2ImgPipeline,
+    ControlNetModel,
+    EulerDiscreteScheduler, EulerAncestralDiscreteScheduler, 
+    HeunDiscreteScheduler, LMSDiscreteScheduler, KDPM2DiscreteScheduler, 
+    KDPM2AncestralDiscreteScheduler,DDIMScheduler, UniPCMultistepScheduler
+)
 
 from controlnet_aux import OpenposeDetector
-from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
-from diffusers import UniPCMultistepScheduler
 from controlnet_aux import OpenposeDetector,MLSDdetector,HEDdetector,HEDdetector
 
 from diffusers.utils import load_image
@@ -159,6 +166,7 @@ def init_pipeline(model_name: str,model_args=None):
     if control_net_enable:
         model_name=DEFAULT_MODEL if "s3" in model_name else model_name
         controlnet_model = ControlNetModel.from_pretrained(f"{control_net_prefix}-canny", torch_dtype=torch.float16)
+        # txt to image, with controlnet
         pipe = StableDiffusionControlNetPipeline.from_pretrained(
             model_name, controlnet=controlnet_model,torch_dtype=torch.float16
         )
@@ -253,7 +261,7 @@ def model_fn():
         except Exception as e:
             print("deepspeed accelarate excpetion!")
             print(e)
-        
+
     
     model = model.to("cuda")
     model.enable_attention_slicing()
@@ -294,11 +302,32 @@ def prepare_opt(input_data):
         "width", 512), minn=64, maxn=max_width)
     opt["count"] = clamp_input(input_data.get(
         "count", 1), minn=1, maxn=max_count)
-    opt["seed"] = input_data.get("seed", 1024)
-    opt["input_image"] = input_data.get("input_image", None)
-    opt["control_net_model"] = input_data.get("control_net_model","")
-    opt["control_net_detect"] = input_data.get("control_net_detect","true")
     
+    opt["seed"] = input_data.get("seed", -1)
+    if opt["seed"] == -1:
+        opt["seed"] = random.randrange(4294967294)
+
+    # check task type, defaults to txt2img
+    opt["task_type"] = input_data.get('task_type', 'txt2img')
+    if opt["task_type"] not in TASK_TYPES_ALLOWED:
+        raise Exception(f'task type "{opt["task_type"]}" is not supported. Choose from {TASK_TYPES_ALLOWED}')
+
+    init_image = None
+    if opt["task_type"] == 'img2img':
+        init_image = input_data.get('init_image')
+
+        if not (init_image.startswith('http://') or init_image.startswith('https://')):
+            print('base image seems not a URL, try base64 decode')
+            init_image = base64.b64decode(init_image)
+            init_image = Image.open(io.BytesIO(init_image))
+
+        init_image     = load_image(init_image)
+        init_image.resize( (input_data["width"], input_data["height"]) )
+
+    opt['init_image']  = init_image
+    opt["control_net_model"]  = input_data.get("control_net_model","")
+    opt["control_net_detect"] = input_data.get("control_net_detect","true")
+
     if  opt["control_net_model"] not in control_net_postfix:
         opt["control_net_model"]=""
     
@@ -310,6 +339,18 @@ def prepare_opt(input_data):
     print(f"=================prepare_opt=================\n{opt}")
     return opt
 
+bucket= get_default_bucket()
+
+if bucket is None:
+    raise Exception("Need setup default bucket")
+
+default_output_s3uri = f's3://{bucket}/stablediffusion/asyncinvoke/images/'
+
+TASK_TYPES_ALLOWED = [
+    'txt2img',
+    'img2img',
+    # 'inpaint',
+]
 
 def predict_fn(input_data, model):
     """
@@ -320,88 +361,57 @@ def predict_fn(input_data, model):
     prediction = []
 
     try:
-        bucket= get_default_bucket()
-    
-        if bucket is None:
-            raise Exception("Need setup default bucket")
-        default_output_s3uri = f's3://{bucket}/stablediffusion/asyncinvoke/images/'
+        
         output_s3uri = input_data['output_s3uri'] if 'output_s3uri' in input_data else default_output_s3uri
-        infer_args = input_data['infer_args'] if (
-            'infer_args' in input_data) else None
-        print('infer_args: ', infer_args)
-        init_image = infer_args['init_image'] if infer_args is not None and 'init_image' in infer_args else None
-        input_image = input_data['input_image']
-        print('init_image: ', init_image)
-        print('input_image: ', input_image)
 
         # load different Pipeline for txt2img , img2img
         # referen doc: https://huggingface.co/docs/diffusers/api/diffusion_pipeline#diffusers.DiffusionPipeline.components
         #   text2img = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4")
         #   img2img = StableDiffusionImg2ImgPipeline(**text2img.components)
         #   inpaint = StableDiffusionInpaintPipeline(**text2img.components)
-        #  use StableDiffusionImg2ImgPipeline for input_image        
-        if input_image is not None:
-            response = requests.get(input_image, timeout=5)
-            init_img = Image.open(io.BytesIO(response.content)).convert("RGB")
-            init_img = init_img.resize(
-                (input_data["width"], input_data["height"]))
+
+        if input_data['task_type'] == 'img2img':
             if not control_net_enable:
-                model = StableDiffusionImg2ImgPipeline(**model.components)  # need use Img2ImgPipeline
-                
-                
+                model = StableDiffusionImg2ImgPipeline(**model.components)
+
         generator = torch.Generator(
             device='cuda').manual_seed(input_data["seed"])
-        
-        control_net_model_name=input_data.get("control_net_model")
-        control_net_detect=input_data.get("control_net_detect")
-        if control_net_enable:
-            if control_net_detect=="true":
-                print(f"detect_process {input_image}")
-                control_net_input_image=processor.detect_process(control_net_model_name,input_image)
-            else:
-                control_net_input_image=load_image(input_image)
-        
+
+        # control_net_model_name=input_data.get("control_net_model") # 
+        # control_net_detect=input_data.get("control_net_detect")
+        # if control_net_enable:
+        #     if control_net_detect=="true":
+        #         print(f"detect_process {input_image}")
+        #         control_net_input_image=processor.detect_process(control_net_model_name,input_image)
+        #     else:
+        #         control_net_input_image=load_image(input_image)
+
         with autocast("cuda"):
-            if model != None:
-                model.scheduler = input_data["sampler"].from_config(
-                    model.scheduler.config)
-            if input_image is None:
+            model.scheduler = input_data["sampler"].from_config(model.scheduler.config)
+            if input_data['task_type'] == 'txt2img':
                 images = model(input_data["prompt"], input_data["height"], input_data["width"], negative_prompt=input_data["negative_prompt"],
                                num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
-            else:
-                if control_net_enable:
-                    model_name = os.environ.get("model_name", DEFAULT_MODEL)
-                    pipe=init_control_net_pipeline(model_name,input_data["control_net_model"])    
-                    pipe.enable_model_cpu_offload()
-                    images = pipe(input_data["prompt"], image=control_net_input_image, negative_prompt=input_data["negative_prompt"],
-                               num_inference_steps=input_data["steps"], generator=generator).images
-                    grid_images=[]
-                    grid_images.insert(0,control_net_input_image)
-                    grid_images.insert(0,init_img)
-                    grid_images.extend(images)
-                    grid_image=image_grid(grid_images,1,len(grid_images))
-                    
-                    if control_net_detect=="true":
-                        images.append(control_net_input_image)
-                    images.append(grid_image)
-
-                else:
-                    images = model(input_data["prompt"], image=init_img, negative_prompt=input_data["negative_prompt"],
+            elif input_data['task_type'] == 'img2img':
+                images = model(input_data["prompt"], image=input_data['init_image'], negative_prompt=input_data["negative_prompt"],
                                num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
-            # image watermark
-            if watermarket:
-                watermarket_image_path=f"/opt/ml/model/{watermarket_image}"
-                if os.path.isfile(watermarket_image_path) is False:
-                    watermarket_image_path="/opt/program/sagemaker-logo-small.png"
-                print(f"watermarket image path: {watermarket_image_path}")
-                crop_image = Image.open(watermarket_image_path)
-                size = (200, 39)
-                crop_image.thumbnail(size)
-                if crop_image.mode != "RGBA":
-                    crop_image = crop_image.convert("RGBA")
-                layer = Image.new("RGBA",[input_data["width"],input_data["height"]],(0,0,0,0))
-                layer.paste(crop_image,(input_data["width"]-210, input_data["height"]-49))
-            
+
+#             if control_net_enable:
+#                 model_name = os.environ.get("model_name", DEFAULT_MODEL)
+#                 pipe=init_control_net_pipeline(model_name,input_data["control_net_model"])    
+#                 pipe.enable_model_cpu_offload()
+#                 images = pipe(input_data["prompt"], image=control_net_input_image, negative_prompt=input_data["negative_prompt"],
+#                            num_inference_steps=input_data["steps"], generator=generator).images
+#                 grid_images=[]
+#                 grid_images.insert(0,control_net_input_image)
+#                 grid_images.insert(0,init_img)
+#                 grid_images.extend(images)
+#                 grid_image=image_grid(grid_images,1,len(grid_images))
+
+#                 if control_net_detect=="true":
+#                     images.append(control_net_input_image)
+#                 images.append(grid_image)
+
+
             for image in images:
                 bucket, key = get_bucket_and_key(output_s3uri)
                 key = f'{key}{uuid.uuid4()}.jpg'
