@@ -81,7 +81,7 @@ if lora_models:
             if model_path.startswith("s3://"):
                 _dir_path = str(uuid.uuid4())
                 local_lora_path = f"/tmp/{_dir_path}/"
-                print(f"LoRA {model_alias}: mkdir {local_lora_path}")
+                # print(f"LoRA {model_alias}: mkdir {local_lora_path}")
                 os.makedirs(local_lora_path)
                 fs.get(model_path, local_lora_path)
                 local_lora_file = local_lora_path + os.path.basename(model_path)
@@ -174,19 +174,33 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def load_lora_networks(pipeline, lora, unload=False, device='cuda', dtype=torch.float16):
+def load_lora_networks(pipeline, lora, device='cuda', dtype=torch.float16):
     for network, weight in lora.items():
-        print('loading lora: ', network, weight)
-        _load_lora_weights(pipeline, network, weight, unload, device, dtype)
+        _load_lora_weights(pipeline, network, weight, False, device, dtype)
 
     return pipeline
+
+
+def unload_lora_networks(pipeline, lora, device='cuda', dtype=torch.float16):
+    for network, weight in lora.items():
+        _load_lora_weights(pipeline, network, weight, True, device, dtype)
+
+    return pipeline
+
 
 
 def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda', dtype=torch.float16):
     checkpoint_path = lora_models[lora_network]
 
+    if unload: # just unload weights
+        print('unloading lora: ', lora_network, multiplier)
+    else:
+        print('loading lora: ', lora_network, multiplier)
+
     if not checkpoint_path.endswith('.safetensors'):
-        return pipeline.unet.load_attn_procs(checkpoint_path)
+        print(f'not support lora format: {lora_network}. should be .safetensors')
+        return pipeline
+        # return pipeline.unet.load_attn_procs(checkpoint_path)
 
     LORA_PREFIX_UNET = "lora_unet"
     LORA_PREFIX_TEXT_ENCODER = "lora_te"
@@ -224,32 +238,39 @@ def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda'
                 else:
                     temp_name = layer_infos.pop(0)
 
-        backup_attr_name = f"origin_attr_{lora_network}_{temp_name}"
-        
-        if unload: # just unload weights
+        backup_attr_name = f"origin_attr_{temp_name}"
+
+        if unload:  # just unload weights
             if hasattr(curr_layer, backup_attr_name):
-                # print('reset weight: ', backup_attr_name)
+                # print(f'unload lora {lora_network}: layer attr {backup_attr_name}')
                 del curr_layer.weight
                 curr_layer.weight = getattr(curr_layer, backup_attr_name)
                 delattr(curr_layer, backup_attr_name)
+            # else:
+                # print(f'unload lora {lora_network}: layer attr {temp_name} not found!!!')
+
+            continue
+
+        if not hasattr(curr_layer, backup_attr_name):
+            # print(f'load lora {lora_network}: set layer attr {temp_name}')
+            curr_layer.__setattr__(backup_attr_name, copy.deepcopy(curr_layer.weight.data))
+        # else:
+            # print(f'load lora {lora_network}: layer attr {temp_name} already found!!!')
+
+        # get elements for this layer
+        weight_up = elems['lora_up.weight'].to(dtype)
+        weight_down = elems['lora_down.weight'].to(dtype)
+        alpha = elems['alpha']
+        if alpha:
+            alpha = alpha.item() / weight_up.shape[1]
         else:
-            if not hasattr(curr_layer, backup_attr_name):
-                curr_layer.__setattr__(backup_attr_name, copy.deepcopy(curr_layer.weight.data))
+            alpha = 1.0
 
-            # get elements for this layer
-            weight_up = elems['lora_up.weight'].to(dtype)
-            weight_down = elems['lora_down.weight'].to(dtype)
-            alpha = elems['alpha']
-            if alpha:
-                alpha = alpha.item() / weight_up.shape[1]
-            else:
-                alpha = 1.0
-
-            # update weight
-            if len(weight_up.shape) == 4:
-                curr_layer.weight.data += multiplier * alpha * torch.mm(weight_up.squeeze(3).squeeze(2), weight_down.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
-            else:
-                curr_layer.weight.data += multiplier * alpha * torch.mm(weight_up, weight_down)
+        # update weight
+        if len(weight_up.shape) == 4:
+            curr_layer.weight.data += multiplier * alpha * torch.mm(weight_up.squeeze(3).squeeze(2), weight_down.squeeze(3).squeeze(2)).unsqueeze(2).unsqueeze(3)
+        else:
+            curr_layer.weight.data += multiplier * alpha * torch.mm(weight_up, weight_down)
 
     return pipeline
 
@@ -411,8 +432,9 @@ def prepare_opt(input_data):
 
     init_image = None
     if opt["task_type"] == 'img2img':
-        init_image = input_data.get('init_image')
+        opt["strength"] = clamp_input(input_data.get("strength", 0.8), minn=0, maxn=1)
 
+        init_image = input_data.get('init_image')
         if not (init_image.startswith('http://') or init_image.startswith('https://')):
             print('base image seems not a URL, try base64 decode')
             init_image = base64.b64decode(init_image)
@@ -471,14 +493,14 @@ def predict_fn(input_data, model):
         if input_data['task_type'] == 'img2img':
             if not control_net_enable:
                 model = StableDiffusionImg2ImgPipeline(**model.components)
-        
-        if lora_models:
-            load_lora_networks(model, input_data.get('lora'), False, device='cuda', dtype=torch.float16)
+
+        if lora_models and input_data.get('lora'):
+            load_lora_networks(model, input_data.get('lora'))
 
         generator = torch.Generator(
             device='cuda').manual_seed(input_data["seed"])
 
-        # control_net_model_name=input_data.get("control_net_model") # 
+        # control_net_model_name=input_data.get("control_net_model") #
         # control_net_detect=input_data.get("control_net_detect")
         # if control_net_enable:
         #     if control_net_detect=="true":
@@ -494,7 +516,8 @@ def predict_fn(input_data, model):
                                num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
             elif input_data['task_type'] == 'img2img':
                 images = model(input_data["prompt"], image=input_data['init_image'], negative_prompt=input_data["negative_prompt"],
-                               num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
+                               strength = input_data["strength"], num_inference_steps=input_data["steps"], 
+                               num_images_per_prompt=input_data["count"], generator=generator).images
 
 #             if control_net_enable:
 #                 model_name = os.environ.get("model_name", DEFAULT_MODEL)
@@ -516,11 +539,12 @@ def predict_fn(input_data, model):
                 bucket, key = get_bucket_and_key(output_s3uri)
                 key = f'{key}{uuid.uuid4()}.jpg'
                 buf = io.BytesIO()
-                if watermarket:
-                    out = Image.composite(layer,image,layer)
-                    out.save(buf, format='JPEG')
-                else:
-                    image.save(buf, format='JPEG')
+                image.save(buf, format='JPEG')
+
+                # local_name = f"/tmp/assets/model-output/{uuid.uuid4()}.jpg"
+                # with open(f"{local_name}", "wb") as f:
+                #     print(f"saved image to {local_name}")
+                #     f.write(buf.getbuffer())
 
                 s3_client.put_object(
                     Body=buf.getvalue(),
@@ -528,15 +552,15 @@ def predict_fn(input_data, model):
                     Key=key,
                     ContentType='image/jpeg',
                     Metadata={
-                        # #s3 metadata only support ascii
+                        #s3 metadata only support ascii
                         "seed": str(input_data["seed"])
                     }
                 )
                 print('image: ', f's3://{bucket}/{key}')
                 prediction.append(f's3://{bucket}/{key}')
 
-        if lora_models:
-            load_lora_networks(model, input_data.get('lora'), True, device='cuda', dtype=torch.float16)
+        if lora_models and input_data.get('lora'):
+            unload_lora_networks(model, input_data.get('lora'))
 
     except Exception as ex:
         traceback.print_exc(file=sys.stdout)
