@@ -31,7 +31,7 @@ import boto3
 import sagemaker
 import torch
 
-from torch import autocast
+from lpw import get_weighted_text_embeddings
 
 from diffusers import (
     StableDiffusionPipeline, StableDiffusionImg2ImgPipeline,
@@ -75,7 +75,7 @@ DEFAULT_MODEL = "runwayml/stable-diffusion-v1-5"
 if lora_models:
     if not isinstance(lora_models, dict):
         example_param = {'model_1':'s3://bkt/obj.safetensors', 'model_2':'hf/lora_model_id'}
-        raise Exception(f"lora_models param error, {lora_model} is not supported. use format: {example_param}")
+        raise Exception(f"lora_models param error, {lora_models} is not supported. use format: {example_param}")
 
     for (model_alias, model_path) in lora_models.items():
         if model_path.endswith('.safetensors'):
@@ -202,7 +202,7 @@ def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda'
     checkpoint_path = lora_models.get(lora_network)
 
     if not lora_network:
-        print(f'lora file not found: {lora_network}.')
+        print(f'lora not downloaded: {lora_network}.')
         return pipeline
 
     if unload: # just unload weights
@@ -290,10 +290,15 @@ def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda'
     return pipeline
 
 
+model_path = None
+
+
 def init_pipeline(model_name: str, model_args=None):
     """
     help load model from s3
     """
+    global model_path
+
     print(f"=================init_pipeline:{model_name}=================")
 
     if control_net_enable:
@@ -492,98 +497,68 @@ def predict_fn(input_data, model):
     print('input_data: ', input_data)
     prediction = []
 
-    try:
-        output_s3uri = input_data['output_s3uri'] if 'output_s3uri' in input_data else default_output_s3uri
+    output_s3uri = input_data.get('output_s3uri', default_output_s3uri)
 
-        # load different Pipeline for txt2img , img2img
-        # referen doc: https://huggingface.co/docs/diffusers/api/diffusion_pipeline#diffusers.DiffusionPipeline.components
-        #   text2img = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4")
-        #   img2img = StableDiffusionImg2ImgPipeline(**text2img.components)
-        #   inpaint = StableDiffusionInpaintPipeline(**text2img.components)
+    # load different Pipeline for txt2img , img2img
+    # referen doc: https://huggingface.co/docs/diffusers/api/diffusion_pipeline#diffusers.DiffusionPipeline.components
+    #   text2img = StableDiffusionPipeline.from_pretrained("CompVis/stable-diffusion-v1-4")
+    #   img2img = StableDiffusionImg2ImgPipeline(**text2img.components)
+    #   inpaint = StableDiffusionInpaintPipeline(**text2img.components)
 
-        if input_data['task_type'] == 'img2img':
-            if not control_net_enable:
-                model = StableDiffusionImg2ImgPipeline(**model.components)
+    if input_data['task_type'] == 'img2img':
+        model = StableDiffusionImg2ImgPipeline(**model.components)
 
-        if lora_models and input_data.get('lora'):
-            load_lora_networks(model, input_data.get('lora'))
+    if lora_models and input_data.get('lora'):
+        load_lora_networks(model, input_data.get('lora'))
 
-        generator = torch.Generator(
-            device='cuda').manual_seed(input_data["seed"])
+    generator = torch.Generator(device='cuda').manual_seed(input_data["seed"])
 
-        # control_net_model_name=input_data.get("control_net_model") #
-        # control_net_detect=input_data.get("control_net_detect")
-        # if control_net_enable:
-        #     if control_net_detect=="true":
-        #         print(f"detect_process {input_image}")
-        #         control_net_input_image=processor.detect_process(control_net_model_name,input_image)
-        #     else:
-        #         control_net_input_image=load_image(input_image)
+    with torch.inference_mode():
+        prompt_embeds, negative_prompt_embeds = get_weighted_text_embeddings(model, input_data["prompt"], input_data["negative_prompt"])
+        # model.scheduler = input_data["sampler"].from_config(model.scheduler.config, use_karras_sigmas=input_data["use_karras_sigmas"])
+        model.scheduler = input_data["sampler"].from_pretrained(model_path, 'scheduler', use_karras_sigmas=input_data["use_karras_sigmas"])
 
-        with torch.inference_mode():
-            model.scheduler = input_data["sampler"].from_config(model.scheduler.config, use_karras_sigmas=input_data["use_karras_sigmas"])
+        if isinstance(input_data["sampler"], PNDMScheduler):
+            model.scheduler.skip_prk_steps = True
 
-            if isinstance(input_data["sampler"], PNDMScheduler):
-                model.scheduler.skip_prk_steps = True
+        if input_data['task_type'] == 'txt2img':
+            images = model(height=input_data["height"], width=input_data["width"],
+                           num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], 
+                           prompt_embeds=prompt_embeds, negative_prompt_embeds=negative_prompt_embeds,
+                           generator=generator).images
+        elif input_data['task_type'] == 'img2img':
+            images = model(image=input_data['init_image'], strength=input_data["strength"], 
+                           num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], 
+                           prompt_embeds=prompt_embeds, negative_prompt_embeds=negative_prompt_embeds,
+                           generator=generator).images
 
-            if input_data['task_type'] == 'txt2img':
-                images = model(input_data["prompt"], height=input_data["height"], 
-                               width=input_data["width"], negative_prompt=input_data["negative_prompt"],
-                               num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], 
-                               generator=generator).images
-            elif input_data['task_type'] == 'img2img':
-                images = model(input_data["prompt"], image=input_data['init_image'], negative_prompt=input_data["negative_prompt"],
-                               strength = input_data["strength"], num_inference_steps=input_data["steps"], 
-                               num_images_per_prompt=input_data["count"], generator=generator).images
+        for image in images:
+            bucket, key = get_bucket_and_key(output_s3uri)
+            key = f'{key}{uuid.uuid4()}.jpg'
+            buf = io.BytesIO()
+            image.save(buf, format='JPEG')
 
-#             if control_net_enable:
-#                 model_name = os.environ.get("model_name", DEFAULT_MODEL)
-#                 pipe=init_control_net_pipeline(model_name,input_data["control_net_model"])    
-#                 pipe.enable_model_cpu_offload()
-#                 images = pipe(input_data["prompt"], image=control_net_input_image, negative_prompt=input_data["negative_prompt"],
-#                            num_inference_steps=input_data["steps"], generator=generator).images
-#                 grid_images=[]
-#                 grid_images.insert(0,control_net_input_image)
-#                 grid_images.insert(0,init_img)
-#                 grid_images.extend(images)
-#                 grid_image=image_grid(grid_images,1,len(grid_images))
+            if save_image_to_local:
+                local_name = f"/tmp/assets/model-output/{uuid.uuid4()}.jpg"
+                with open(f"{local_name}", "wb") as f:
+                    print(f"saved image to local: {local_name}")
+                    f.write(buf.getbuffer())
+            else:
+                s3_client.put_object(
+                    Body=buf.getvalue(),
+                    Bucket=bucket,
+                    Key=key,
+                    ContentType='image/jpeg',
+                    Metadata={
+                        #s3 metadata only support ascii
+                        "seed": str(input_data["seed"])
+                    }
+                )
+                print('image: ', f's3://{bucket}/{key}')
+                prediction.append(f's3://{bucket}/{key}')
 
-#                 if control_net_detect=="true":
-#                     images.append(control_net_input_image)
-#                 images.append(grid_image)
-
-            for image in images:
-                bucket, key = get_bucket_and_key(output_s3uri)
-                key = f'{key}{uuid.uuid4()}.jpg'
-                buf = io.BytesIO()
-                image.save(buf, format='JPEG')
-
-                if save_image_to_local:
-                    local_name = f"/tmp/assets/model-output/{uuid.uuid4()}.jpg"
-                    with open(f"{local_name}", "wb") as f:
-                        print(f"saved image to local: {local_name}")
-                        f.write(buf.getbuffer())
-                else:
-                    s3_client.put_object(
-                        Body=buf.getvalue(),
-                        Bucket=bucket,
-                        Key=key,
-                        ContentType='image/jpeg',
-                        Metadata={
-                            #s3 metadata only support ascii
-                            "seed": str(input_data["seed"])
-                        }
-                    )
-                    print('image: ', f's3://{bucket}/{key}')
-                    prediction.append(f's3://{bucket}/{key}')
-
-        if lora_models and input_data.get('lora'):
-            unload_lora_networks(model, input_data.get('lora'))
-
-    except Exception as ex:
-        traceback.print_exc(file=sys.stdout)
-        print(f"=================Exception================={ex}")
-        raise ex
+    if lora_models and input_data.get('lora'):
+        unload_lora_networks(model, input_data.get('lora'))
 
     print('prediction: ', prediction)
     return prediction
