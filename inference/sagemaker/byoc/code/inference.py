@@ -40,7 +40,8 @@ from diffusers import (
     ControlNetModel,
     EulerDiscreteScheduler, EulerAncestralDiscreteScheduler,
     HeunDiscreteScheduler, LMSDiscreteScheduler, KDPM2DiscreteScheduler,
-    KDPM2AncestralDiscreteScheduler, DDIMScheduler, UniPCMultistepScheduler
+    KDPM2AncestralDiscreteScheduler, DDIMScheduler, PNDMScheduler, UniPCMultistepScheduler,
+    DPMSolverSinglestepScheduler, DPMSolverMultistepScheduler, DPMSolverSDEScheduler
 )
 
 from diffusers.utils import load_image
@@ -61,13 +62,13 @@ max_width = os.environ.get("max_width", 768)
 max_steps = os.environ.get("max_steps", 100)
 max_count = os.environ.get("max_count", 4)
 s3_bucket = os.environ.get("s3_bucket", "")
-watermarket = json.loads(os.environ.get("watermarket", 'true'))
-watermarket_image = os.environ.get("watermarket_image", "sagemaker-logo-small.png")
 custom_region = os.environ.get("custom_region", None)
 safety_checker_enable = json.loads(os.environ.get("safety_checker_enable", "false"))
 control_net_enable = json.loads(os.environ.get("control_net_enable", "true"))
 deepspeed_enable = json.loads(os.environ.get("deepspeed", 'false'))
-lora_models = json.loads(os.environ.get("lora_models")) # "{'model_1':'s3://bkt/obj.safetensors', 'model_2':'hf/lora_model_id'}"
+base_models = json.loads(os.environ.get("base_models", '{}')) # "{'model_1':'s3://bkt/uncomporessed/', 'model_2':'hf/lora_model_id'}"
+lora_models = json.loads(os.environ.get("lora_models", '{}')) # "{'model_1':'s3://bkt/obj.safetensors', 'model_2':'hf/lora_model_id'}"
+save_image_to_local = json.loads(os.environ.get("save_image_to_local", 'false'))
 
 DEFAULT_MODEL = "runwayml/stable-diffusion-v1-5"
 
@@ -156,9 +157,18 @@ samplers = {
     "eular": EulerDiscreteScheduler,
     "heun": HeunDiscreteScheduler,
     "lms": LMSDiscreteScheduler,
-    "dpm2": KDPM2DiscreteScheduler,
-    "dpm2_a": KDPM2AncestralDiscreteScheduler,
-    "ddim": DDIMScheduler
+    "lms_k": LMSDiscreteScheduler,
+    "dpm2": KDPM2DiscreteScheduler,   # dpm2
+    "dpm2_a": KDPM2AncestralDiscreteScheduler,   # dpm2 a
+    "dpmpp_2s_a": DPMSolverSinglestepScheduler,  # dpm++ 2s a
+    "dpmpp_2m": DPMSolverMultistepScheduler,   #  dpm++ 2m
+    "dpmpp_2m_k": DPMSolverMultistepScheduler, #  dpm ++ 2m karras
+    "dpmpp_sde": DPMSolverSDEScheduler,
+    "dpmpp_sde_k": DPMSolverSDEScheduler,
+    "ddim": DDIMScheduler,  # ddim 
+    "plms": PNDMScheduler,  # plms = pndm config.skip_prk_steps, ref: https://github.com/huggingface/diffusers/issues/960
+    # "dpm_fast": "sample_dpm_fast",
+    # "dpm_adaptive": "sample_dpm_adaptive",
 }
 
 
@@ -188,9 +198,12 @@ def unload_lora_networks(pipeline, lora, device='cuda', dtype=torch.float16):
     return pipeline
 
 
-
 def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda', dtype=torch.float16):
-    checkpoint_path = lora_models[lora_network]
+    checkpoint_path = lora_models.get(lora_network)
+
+    if not lora_network:
+        print(f'lora file not found: {lora_network}.')
+        return pipeline
 
     if unload: # just unload weights
         print('unloading lora: ', lora_network, multiplier)
@@ -219,9 +232,11 @@ def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda'
         if "text" in layer:
             layer_infos = layer.split(LORA_PREFIX_TEXT_ENCODER + "_")[-1].split("_")
             curr_layer = pipeline.text_encoder
-        else:
+        elif "unet" in layer:
             layer_infos = layer.split(LORA_PREFIX_UNET + "_")[-1].split("_")
             curr_layer = pipeline.unet
+        else:
+            raise Exception(f"error: f{lora_network} has invalid layer: {layer}")
 
         # find the target layer
         temp_name = layer_infos.pop(0)
@@ -260,9 +275,9 @@ def _load_lora_weights(pipeline, lora_network, multiplier, unload, device='cuda'
         # get elements for this layer
         weight_up = elems['lora_up.weight'].to(dtype)
         weight_down = elems['lora_down.weight'].to(dtype)
-        alpha = elems['alpha']
-        if alpha:
-            alpha = alpha.item() / weight_up.shape[1]
+
+        if 'alpha' in elems:
+            alpha = elems['alpha'].item() / weight_up.shape[1]
         else:
             alpha = 1.0
 
@@ -295,42 +310,38 @@ def init_pipeline(model_name: str, model_args=None):
 
     model_path = model_name
     base_name = os.path.basename(model_name)
-    try:
-        if model_name.startswith("s3://"):
-            if base_name[-7:] == ".tar.gz":
-                print('model in single tar file.')
-                local_path = "/".join(model_name.split("/")[-2:-1])
-                model_path = f"/tmp/{local_path}/"
-                print(f"need copy {model_name} to {model_path}")
-                if not os.path.exists(model_path):
-                    os.makedirs(model_path)
 
-                fs.get(model_name, model_path, recursive=True)
-                untar(f"/tmp/{local_path}/{base_name}", model_path)
-                os.remove(f"/tmp/{local_path}/{base_name}")
-                print("download and untar completed")
-            elif model_name[-1:] == '/':
-                print('model in folder.')
-                local_path = "/".join(model_name.split("/")[-2:])
-                model_path = f"/tmp/{local_path}"
-                print(f"need copy {model_name} to {model_path}")
-                if not os.path.exists(model_path):
-                    os.makedirs(model_path)
+    if model_name.startswith("s3://"):
+        if base_name[-7:] == ".tar.gz":
+            print('model in single tar file.')
+            local_path = "/".join(model_name.split("/")[-2:-1])
+            model_path = f"/tmp/{local_path}/"
+            print(f"need copy {model_name} to {model_path}")
+            if not os.path.exists(model_path):
+                os.makedirs(model_path)
 
-                fs.get(model_name, model_path, recursive=True)
-                print("download completed")
-            else:
-                print(f'model file "{model_name}" is not support. if input is folder, pls append "/" at end of model_name.')
+            fs.get(model_name, model_path, recursive=True)
+            untar(f"/tmp/{local_path}/{base_name}", model_path)
+            os.remove(f"/tmp/{local_path}/{base_name}")
+            print("download and untar completed")
+        elif model_name[-1:] == '/':
+            print('model in folder.')
+            local_path = "/".join(model_name.split("/")[-2:])
+            model_path = f"/tmp/{local_path}"
+            print(f"need copy {model_name} to {model_path}")
+            if not os.path.exists(model_path):
+                os.makedirs(model_path)
 
-        print(f"pretrained model_path: {model_path}")
-        if model_args is not None:
-            return StableDiffusionPipeline.from_pretrained(
-                 model_path, torch_dtype=torch.float16, **model_args)
-        return StableDiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
-    except Exception as ex:
-        traceback.print_exc(file=sys.stdout)
-        print(f"=================Exception================={ex}")
-        return None
+            fs.get(model_name, model_path, recursive=True)
+            print("download completed")
+        else:
+            print(f'model file "{model_name}" is not support. if input is folder, pls append "/" at end of model_name.')
+
+    print(f"pretrained model_path: {model_path}")
+    if model_args is not None:
+        return StableDiffusionPipeline.from_pretrained(
+             model_path, torch_dtype=torch.float16, **model_args)
+    return StableDiffusionPipeline.from_pretrained(model_path, torch_dtype=torch.float16)
 
 
 # model_name = os.environ.get("model_name", DEFAULT_MODEL)
@@ -349,10 +360,9 @@ def model_fn(model_name=None):
     if model_name is None:
         model_name = os.environ.get("model_name", DEFAULT_MODEL)
 
-    model_args = json.loads(os.environ['model_args']) if (
-        'model_args' in os.environ) else None
-    print(
-        f'model_name: {model_name},  model_args: {model_args}')
+    model_args = json.loads(os.environ.get('model_args', '{}'))
+
+    print(f'model_name: {model_name},  model_args: {model_args}')
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -379,8 +389,7 @@ def model_fn(model_name=None):
 
     model = model.to("cuda")
     model.enable_attention_slicing()
-
-    # model.enable_xformers_memory_efficient_attention()
+    model.enable_xformers_memory_efficient_attention()
     # model.enable_model_cpu_offload()
 
     return model
@@ -412,7 +421,13 @@ def prepare_opt(input_data):
     opt["negative_prompt"] = input_data.get("negative_prompt", "")
     opt["steps"] = clamp_input(input_data.get(
         "steps", 20), minn=20, maxn=max_steps)
-    opt["sampler"] = input_data.get("sampler", None)
+    opt["sampler"] = input_data.get("sampler")
+    if opt["sampler"] not in samplers:
+         raise Exception(f"sampler {opt['sampler']} is not supported. choose from {samplers.keys()}")
+
+    opt["use_karras_sigmas"] = opt["sampler"].endswith('_k')
+    opt["sampler"] = samplers[opt["sampler"]]
+
     opt["height"] = clamp_input(input_data.get(
         "height", 512), minn=64, maxn=max_height)
     opt["width"] = clamp_input(input_data.get(
@@ -450,10 +465,6 @@ def prepare_opt(input_data):
 
     if opt["control_net_model"] not in control_net_postfix:
         opt["control_net_model"] = ""
-
-    if opt["sampler"] is not None:
-        opt["sampler"] = samplers[opt["sampler"]
-                                  ] if opt["sampler"] in samplers else samplers["euler_a"]
 
     print(f"=================prepare_opt=================\n{opt}")
     return opt
@@ -509,11 +520,17 @@ def predict_fn(input_data, model):
         #     else:
         #         control_net_input_image=load_image(input_image)
 
-        with autocast("cuda"):
-            model.scheduler = input_data["sampler"].from_config(model.scheduler.config)
+        with torch.inference_mode():
+            model.scheduler = input_data["sampler"].from_config(model.scheduler.config, use_karras_sigmas=input_data["use_karras_sigmas"])
+
+            if isinstance(input_data["sampler"], PNDMScheduler):
+                model.scheduler.skip_prk_steps = True
+
             if input_data['task_type'] == 'txt2img':
-                images = model(input_data["prompt"], input_data["height"], input_data["width"], negative_prompt=input_data["negative_prompt"],
-                               num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], generator=generator).images
+                images = model(input_data["prompt"], height=input_data["height"], 
+                               width=input_data["width"], negative_prompt=input_data["negative_prompt"],
+                               num_inference_steps=input_data["steps"], num_images_per_prompt=input_data["count"], 
+                               generator=generator).images
             elif input_data['task_type'] == 'img2img':
                 images = model(input_data["prompt"], image=input_data['init_image'], negative_prompt=input_data["negative_prompt"],
                                strength = input_data["strength"], num_inference_steps=input_data["steps"], 
@@ -541,23 +558,24 @@ def predict_fn(input_data, model):
                 buf = io.BytesIO()
                 image.save(buf, format='JPEG')
 
-                # local_name = f"/tmp/assets/model-output/{uuid.uuid4()}.jpg"
-                # with open(f"{local_name}", "wb") as f:
-                #     print(f"saved image to {local_name}")
-                #     f.write(buf.getbuffer())
-
-                s3_client.put_object(
-                    Body=buf.getvalue(),
-                    Bucket=bucket,
-                    Key=key,
-                    ContentType='image/jpeg',
-                    Metadata={
-                        #s3 metadata only support ascii
-                        "seed": str(input_data["seed"])
-                    }
-                )
-                print('image: ', f's3://{bucket}/{key}')
-                prediction.append(f's3://{bucket}/{key}')
+                if save_image_to_local:
+                    local_name = f"/tmp/assets/model-output/{uuid.uuid4()}.jpg"
+                    with open(f"{local_name}", "wb") as f:
+                        print(f"saved image to local: {local_name}")
+                        f.write(buf.getbuffer())
+                else:
+                    s3_client.put_object(
+                        Body=buf.getvalue(),
+                        Bucket=bucket,
+                        Key=key,
+                        ContentType='image/jpeg',
+                        Metadata={
+                            #s3 metadata only support ascii
+                            "seed": str(input_data["seed"])
+                        }
+                    )
+                    print('image: ', f's3://{bucket}/{key}')
+                    prediction.append(f's3://{bucket}/{key}')
 
         if lora_models and input_data.get('lora'):
             unload_lora_networks(model, input_data.get('lora'))
@@ -565,6 +583,7 @@ def predict_fn(input_data, model):
     except Exception as ex:
         traceback.print_exc(file=sys.stdout)
         print(f"=================Exception================={ex}")
+        raise ex
 
     print('prediction: ', prediction)
     return prediction
