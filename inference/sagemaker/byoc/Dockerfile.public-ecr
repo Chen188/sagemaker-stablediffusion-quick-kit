@@ -1,14 +1,12 @@
 FROM public.ecr.aws/o7x6j3x6/sd-dreambooth-finetuning-v2
 
-RUN pip install --no-cache-dir boto3==1.26.64
+RUN pip install --no-cache-dir diffusers==0.17.1 accelerate==0.19.0 controlnet_aux
 
-RUN pip install --no-cache-dir fastapi uvicorn sagemaker
-RUN pip install --no-cache-dir git+https://github.com/huggingface/diffusers.git@90f5f3c4d4b9fc5166e471b475a70a3dd3077d0a accelerate==0.19.0 controlnet_aux
+# fix boto3 version confict with s3fs, sagemaker
+RUN pip install --no-cache-dir s3fs==2023.6.0 sagemaker==2.154.0
+RUN conda install xformers==0.0.20 -c xformers
 
-RUN pip install s3fs==2023.3.0
-
-
-RUN curl -L https://github.com/peak/s5cmd/releases/download/v2.0.0/s5cmd_2.0.0_Linux-64bit.tar.gz | tar -xz && mv s5cmd /opt/conda/bin/
+RUN curl -L https://github.com/peak/s5cmd/releases/download/v2.0.0/s5cmd_2.0.0_Linux-64bit.tar.gz | tar -xz && mv s5cmd /usr/local/bin/
 
 ENV PATH="/opt/program:${PATH}"
 COPY code /opt/program
